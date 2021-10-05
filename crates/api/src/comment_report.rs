@@ -7,6 +7,7 @@ use lemmy_api_common::{
   get_local_user_view_from_jwt,
   is_mod_or_admin,
 };
+use lemmy_apub::{activities::report::Report, fetcher::object_id::ObjectId};
 use lemmy_db_queries::Reportable;
 use lemmy_db_schema::source::comment_report::*;
 use lemmy_db_views::{
@@ -19,13 +20,13 @@ use lemmy_websocket::{messages::SendModRoomMessage, LemmyContext, UserOperation}
 /// Creates a comment report and notifies the moderators of the community
 #[async_trait::async_trait(?Send)]
 impl Perform for CreateCommentReport {
-  type Response = CommentReportResponse;
+  type Response = ();
 
   async fn perform(
     &self,
     context: &Data<LemmyContext>,
     websocket_id: Option<ConnectionId>,
-  ) -> Result<CommentReportResponse, LemmyError> {
+  ) -> Result<(), LemmyError> {
     let data: &CreateCommentReport = self;
     let local_user_view =
       get_local_user_view_from_jwt(&data.auth, context.pool(), context.secret()).await?;
@@ -48,36 +49,45 @@ impl Perform for CreateCommentReport {
 
     check_community_ban(person_id, comment_view.community.id, context.pool()).await?;
 
-    let report_form = CommentReportForm {
-      creator_id: person_id,
-      comment_id,
-      original_comment_text: comment_view.comment.content,
-      reason: data.reason.to_owned(),
-    };
+    if comment_view.community.local {
+      let report_form = CommentReportForm {
+        creator_id: person_id,
+        comment_id,
+        original_comment_text: comment_view.comment.content,
+        reason: data.reason.to_owned(),
+      };
 
-    let report = blocking(context.pool(), move |conn| {
-      CommentReport::report(conn, &report_form)
-    })
-    .await?
-    .map_err(|_| ApiError::err("couldnt_create_report"))?;
+      let report = blocking(context.pool(), move |conn| {
+        CommentReport::report(conn, &report_form)
+      })
+      .await?
+      .map_err(|_| ApiError::err("couldnt_create_report"))?;
 
-    let comment_report_view = blocking(context.pool(), move |conn| {
-      CommentReportView::read(conn, report.id, person_id)
-    })
-    .await??;
+      let comment_report_view = blocking(context.pool(), move |conn| {
+        CommentReportView::read(conn, report.id, person_id)
+      })
+      .await??;
 
-    let res = CommentReportResponse {
-      comment_report_view,
-    };
+      context.chat_server().do_send(SendModRoomMessage {
+        op: UserOperation::CreateCommentReport,
+        response: CommentReportResponse {
+          comment_report_view,
+        },
+        community_id: comment_view.community.id,
+        websocket_id,
+      });
+    } else {
+      Report::send(
+        ObjectId::new(comment_view.comment.ap_id),
+        &local_user_view.person,
+        comment_view.community.id,
+        reason.to_string(),
+        context,
+      )
+      .await?;
+    }
 
-    context.chat_server().do_send(SendModRoomMessage {
-      op: UserOperation::CreateCommentReport,
-      response: res.clone(),
-      community_id: comment_view.community.id,
-      websocket_id,
-    });
-
-    Ok(res)
+    Ok(())
   }
 }
 
